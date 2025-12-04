@@ -7,12 +7,12 @@ import threading
 import time
 import keyboard
 from PIL import Image, ImageTk
-
-# 不需要递归限制了，因为我们改用了 OpenCV 的轮廓算法
-# sys.setrecursionlimit(100000) 
+import subprocess
+import os
+import math
 
 class ScreenAreaSelector:
-    """全屏透明遮罩，用于框选区域 (保持不变)"""
+    """全屏透明遮罩，用于 PC 屏幕框选区域"""
     def __init__(self, master, callback):
         self.master = master
         self.callback = callback
@@ -49,55 +49,155 @@ class ScreenAreaSelector:
         if width < 10 or height < 10: return
         self.callback((left, top, width, height))
 
+class ADBImageSelector:
+    """新窗口显示手机截图，用于 ADB 坐标映射框选"""
+    def __init__(self, master, cv_image, callback):
+        self.master = master
+        self.callback = callback
+        self.original_image = cv_image
+        self.h, self.w = cv_image.shape[:2]
+        
+        self.top = tk.Toplevel(master)
+        self.top.title("请在手机截图中框选绘图区域")
+        self.top.state('zoomed') 
+        
+        # 计算显示缩放比例
+        screen_h = self.top.winfo_screenheight() - 100
+        self.display_scale = 1.0
+        if self.h > screen_h:
+            self.display_scale = screen_h / self.h
+            
+        display_w = int(self.w * self.display_scale)
+        display_h = int(self.h * self.display_scale)
+        
+        resized = cv2.resize(cv_image, (display_w, display_h))
+        resized = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
+        self.tk_img = ImageTk.PhotoImage(Image.fromarray(resized))
+        
+        self.canvas = tk.Canvas(self.top, width=display_w, height=display_h, cursor="cross")
+        self.canvas.pack(padx=10, pady=10)
+        self.canvas.create_image(0, 0, image=self.tk_img, anchor=tk.NW)
+        
+        self.start_x = None
+        self.start_y = None
+        self.rect_id = None
+        
+        self.canvas.bind("<Button-1>", self.on_mouse_down)
+        self.canvas.bind("<B1-Motion>", self.on_mouse_drag)
+        self.canvas.bind("<ButtonRelease-1>", self.on_mouse_up)
+
+    def on_mouse_down(self, event):
+        self.start_x = event.x
+        self.start_y = event.y
+
+    def on_mouse_drag(self, event):
+        if self.rect_id: self.canvas.delete(self.rect_id)
+        self.rect_id = self.canvas.create_rectangle(self.start_x, self.start_y, event.x, event.y, outline="#FF0000", width=2)
+
+    def on_mouse_up(self, event):
+        x1, y1, x2, y2 = self.start_x, self.start_y, event.x, event.y
+        left, right = sorted([x1, x2])
+        top, bottom = sorted([y1, y2])
+        
+        real_left = int(left / self.display_scale)
+        real_top = int(top / self.display_scale)
+        real_w = int((right - left) / self.display_scale)
+        real_h = int((bottom - top) / self.display_scale)
+        
+        self.top.destroy()
+        if real_w < 10 or real_h < 10: return
+        self.callback((real_left, real_top, real_w, real_h))
+
+
 class AutoDrawApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("喜茶喜贴DIY助手")
-        self.root.geometry("1000x750")
+        self.root.title("喜茶喜贴DIY助手 (完全自定义版)")
+        self.root.geometry("1000x900") # 增加高度以容纳新参数
         
         # --- 核心变量 ---
-        self.src_img = None       # 原始图像
+        self.src_img = None       
         self.processed_preview = None 
-        self.final_paths = []     # 最终的路径列表 [[(x,y), (x,y)...], [...]]
+        self.final_paths = []     
         self.target_area = None
         self.is_running = False
         self.drawing_thread = None
         self.debounce_timer = None
         
+        # ADB 变量
+        self.use_adb = tk.BooleanVar(value=False)
+        self.adb_process = None 
+        
         # --- UI 布局 ---
         ctrl_frame = tk.Frame(root, pady=10, bg="#f0f0f0")
         ctrl_frame.pack(side=tk.TOP, fill=tk.X)
         
-        tk.Button(ctrl_frame, text="1. 上传图片", command=self.load_image, bg="white").pack(side=tk.LEFT, padx=10)
+        # 第一行：基础操作
+        row1 = tk.Frame(ctrl_frame, bg="#f0f0f0")
+        row1.pack(side=tk.TOP, fill=tk.X, padx=10, pady=5)
         
-        param_frame = tk.Frame(ctrl_frame, bg="#f0f0f0")
-        param_frame.pack(side=tk.LEFT, padx=10)
+        tk.Button(row1, text="1. 上传图片", command=self.load_image, bg="white").pack(side=tk.LEFT, padx=5)
+        tk.Label(row1, text="|", bg="#f0f0f0").pack(side=tk.LEFT, padx=5)
+        
+        tk.Checkbutton(row1, text="ADB 模式", variable=self.use_adb, command=self.toggle_adb_mode, bg="#f0f0f0").pack(side=tk.LEFT, padx=5)
+        self.btn_adb_cap = tk.Button(row1, text="获取手机截屏", command=self.capture_adb_screen, bg="#ffcc80", state=tk.DISABLED)
+        self.btn_adb_cap.pack(side=tk.LEFT, padx=5)
+        
+        tk.Label(row1, text="|", bg="#f0f0f0").pack(side=tk.LEFT, padx=5)
+        
+        self.btn_select_area = tk.Button(row1, text="2. 框选区域", command=self.select_screen_area, bg="#b3e5fc")
+        self.btn_select_area.pack(side=tk.LEFT, padx=5)
 
-        # 1. 边缘检测阈值 (Canny)
-        tk.Label(param_frame, text="边缘细节:", bg="#f0f0f0", font=("Arial", 8)).grid(row=0, column=0)
-        self.scale_canny = tk.Scale(param_frame, from_=255, to=10, orient=tk.HORIZONTAL, command=self.trigger_update, showvalue=0, length=100)
+        # 第二行：图片预处理参数
+        param_frame = tk.LabelFrame(ctrl_frame, text="图片处理参数", bg="#f0f0f0", padx=5, pady=5)
+        param_frame.pack(side=tk.TOP, fill=tk.X, padx=10, pady=5)
+
+        tk.Label(param_frame, text="边缘细节:", bg="#f0f0f0", font=("Arial", 9)).grid(row=0, column=0)
+        self.scale_canny = tk.Scale(param_frame, from_=255, to=10, orient=tk.HORIZONTAL, command=self.trigger_update, showvalue=0, length=120)
         self.scale_canny.set(100)
         self.scale_canny.grid(row=0, column=1)
 
-        # 2. 忽略短线
-        tk.Label(param_frame, text="忽略短线:", bg="#f0f0f0", font=("Arial", 8)).grid(row=0, column=2)
-        self.scale_min_len = tk.Scale(param_frame, from_=0, to=100, orient=tk.HORIZONTAL, command=self.trigger_update, showvalue=1, length=100)
+        tk.Label(param_frame, text="忽略短线:", bg="#f0f0f0", font=("Arial", 9)).grid(row=0, column=2)
+        self.scale_min_len = tk.Scale(param_frame, from_=0, to=100, orient=tk.HORIZONTAL, command=self.trigger_update, showvalue=1, length=120)
         self.scale_min_len.set(10) 
         self.scale_min_len.grid(row=0, column=3)
 
-        # 3. 连接距离 (优化路径)
-        tk.Label(param_frame, text="自动连接:", bg="#f0f0f0", font=("Arial", 8)).grid(row=1, column=0)
-        self.scale_connect = tk.Scale(param_frame, from_=0, to=50, orient=tk.HORIZONTAL, command=self.trigger_update, showvalue=1, length=100)
+        tk.Label(param_frame, text="自动连接:", bg="#f0f0f0", font=("Arial", 9)).grid(row=0, column=4)
+        self.scale_connect = tk.Scale(param_frame, from_=0, to=50, orient=tk.HORIZONTAL, command=self.trigger_update, showvalue=1, length=120)
         self.scale_connect.set(5) 
-        self.scale_connect.grid(row=1, column=1)
+        self.scale_connect.grid(row=0, column=5)
         
-        # 4. 笔画速度
-        tk.Label(param_frame, text="笔画间隔(s):", bg="#f0f0f0", font=("Arial", 8)).grid(row=1, column=2)
-        self.scale_delay = tk.Scale(param_frame, from_=0.0, to=0.5, resolution=0.01, orient=tk.HORIZONTAL, length=100)
-        self.scale_delay.set(0.01) # 默认稍快一点，因为代码优化了
-        self.scale_delay.grid(row=1, column=3)
+        # 第三行：通用绘制参数
+        draw_frame = tk.LabelFrame(ctrl_frame, text="通用绘制参数", bg="#f0f0f0", padx=5, pady=5)
+        draw_frame.pack(side=tk.TOP, fill=tk.X, padx=10, pady=5)
+        
+        tk.Label(draw_frame, text="笔画间隔(秒):", bg="#f0f0f0", font=("Arial", 9)).pack(side=tk.LEFT, padx=5)
+        self.scale_delay = tk.Scale(draw_frame, from_=0.0, to=0.5, resolution=0.01, orient=tk.HORIZONTAL, length=120)
+        self.scale_delay.set(0.01)
+        self.scale_delay.pack(side=tk.LEFT, padx=5)
 
-        tk.Button(ctrl_frame, text="2. 框选区域", command=self.select_screen_area, bg="#b3e5fc").pack(side=tk.LEFT, padx=20)
+        # 第四行：ADB 高级参数 (新增)
+        adb_frame = tk.LabelFrame(ctrl_frame, text="ADB 高级限制参数 (仅ADB模式生效)", bg="#e1f5fe", padx=5, pady=5)
+        adb_frame.pack(side=tk.TOP, fill=tk.X, padx=10, pady=5)
+
+        # 参数1: 拟合精度
+        tk.Label(adb_frame, text="1. 拟合细节:", bg="#e1f5fe", font=("Arial", 9)).pack(side=tk.LEFT, padx=5)
+        # 0.0005(极细) - 0.005(粗糙)
+        self.scale_adb_epsilon = tk.Scale(adb_frame, from_=0.0001, to=0.005, resolution=0.0001, orient=tk.HORIZONTAL, length=120, bg="#e1f5fe")
+        self.scale_adb_epsilon.set(0.001) # 默认最理想值
+        self.scale_adb_epsilon.pack(side=tk.LEFT, padx=5)
+
+        # 参数2: 最小物理距离
+        tk.Label(adb_frame, text="2. 防误触距离(px):", bg="#e1f5fe", font=("Arial", 9)).pack(side=tk.LEFT, padx=5)
+        self.scale_adb_dist = tk.Scale(adb_frame, from_=10, to=50, orient=tk.HORIZONTAL, length=120, bg="#e1f5fe")
+        self.scale_adb_dist.set(20) # 默认最理想值
+        self.scale_adb_dist.pack(side=tk.LEFT, padx=5)
+
+        # 参数3: 最小滑动时间
+        tk.Label(adb_frame, text="3. 最小耗时(ms):", bg="#e1f5fe", font=("Arial", 9)).pack(side=tk.LEFT, padx=5)
+        self.scale_adb_duration = tk.Scale(adb_frame, from_=50, to=300, orient=tk.HORIZONTAL, length=120, bg="#e1f5fe")
+        self.scale_adb_duration.set(160) # 默认最理想值
+        self.scale_adb_duration.pack(side=tk.LEFT, padx=5)
 
         self.info_frame = tk.LabelFrame(root, text="状态", padx=10, pady=5)
         self.info_frame.pack(fill=tk.X, padx=10)
@@ -113,13 +213,51 @@ class AutoDrawApp:
         except:
             pass
 
+    def toggle_adb_mode(self):
+        if self.use_adb.get():
+            self.btn_adb_cap.config(state=tk.NORMAL)
+            self.btn_select_area.config(text="2. 框选区域 (需先获取截屏)", state=tk.DISABLED)
+            self.lbl_status.config(text="ADB 模式已开启。请确保手机已连接并开启调试。")
+        else:
+            self.btn_adb_cap.config(state=tk.DISABLED)
+            self.btn_select_area.config(text="2. 框选区域", state=tk.NORMAL)
+            self.lbl_status.config(text="切换回 PC 鼠标模式。")
+
+    def get_adb_screenshot_data(self):
+        try:
+            process = subprocess.Popen("adb shell screencap -p", shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            data, err = process.communicate()
+            if err: return None
+            return data.replace(b'\r\n', b'\n')
+        except:
+            return None
+
+    def capture_adb_screen(self):
+        self.lbl_status.config(text="正在获取手机截屏...")
+        self.root.update()
+        
+        data = self.get_adb_screenshot_data()
+        if not data:
+            messagebox.showerror("错误", "无法获取截屏，请检查 ADB 连接。")
+            self.lbl_status.config(text="截屏获取失败")
+            return
+
+        try:
+            arr = np.frombuffer(data, np.uint8)
+            img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+            if img is None: raise Exception("Decode failed")
+            
+            self.lbl_status.config(text="截屏成功，请在新窗口中框选。")
+            ADBImageSelector(self.root, img, self.on_area_selected)
+        except Exception as e:
+            messagebox.showerror("错误", f"图像解析失败: {e}")
+
     def load_image(self):
         path = filedialog.askopenfilename(filetypes=[("Images", "*.jpg *.png *.bmp *.jpeg")])
         if not path: return
         img = cv2.imread(path)
         if img is None: return
         
-        # 预处理：调整大小，保持比例，限制最大边长
         h, w = img.shape[:2]
         max_dim = 800
         if w > max_dim or h > max_dim:
@@ -127,7 +265,7 @@ class AutoDrawApp:
             new_w, new_h = int(w * scale), int(h * scale)
             img = cv2.resize(img, (new_w, new_h))
             
-        self.src_img = img # 保持彩色以便后续可能的扩展
+        self.src_img = img 
         self.run_processing_task()
 
     def trigger_update(self, val=None):
@@ -146,34 +284,21 @@ class AutoDrawApp:
     def process_image_logic(self):
         if self.src_img is None: return
         
-        # 1. 转灰度
         gray = cv2.cvtColor(self.src_img, cv2.COLOR_BGR2GRAY)
-        
-        # 2. Canny 边缘检测 (比简单的阈值二值化效果好得多，能提取轮廓线条)
         canny_thresh = self.scale_canny.get()
-        # Canny 需要两个阈值，这里动态计算
         edges = cv2.Canny(gray, canny_thresh // 2, canny_thresh)
-        
-        # 3. 查找轮廓 (这是替代像素遍历递归的核心)
-        # RETR_LIST: 提取所有轮廓，不建立层级
-        # CHAIN_APPROX_SIMPLE: 仅保留端点 (节省内存)，如果需要圆滑曲线可以用 CHAIN_APPROX_NONE
         contours, _ = cv2.findContours(edges, cv2.RETR_LIST, cv2.CHAIN_APPROX_NONE)
         
-        # 4. 转换 OpenCV 轮廓格式为点列表 [[(x,y)...], ...]
         raw_paths = []
         for cnt in contours:
-            # cnt shape is (N, 1, 2) -> convert to [(x,y), (x,y)...]
             pts = cnt.reshape(-1, 2).tolist()
             raw_paths.append(pts)
 
-        # 5. 路径优化 (合并距离近的线段)
         self.final_paths = self.optimize_paths(raw_paths)
         
-        # 6. 生成预览图
         h, w = edges.shape
         preview = np.zeros((h, w), dtype=np.uint8)
         
-        # 在预览图上画出最终路径
         for path in self.final_paths:
             if len(path) > 1:
                 pts = np.array(path, np.int32).reshape((-1, 1, 2))
@@ -183,36 +308,25 @@ class AutoDrawApp:
         self.lbl_status.config(text=f"计算完成: 提取出 {len(self.final_paths)} 条笔画")
 
     def optimize_paths(self, raw_paths):
-        """简单的贪婪算法合并路径"""
         min_len = self.scale_min_len.get()
         connect_dist_sq = self.scale_connect.get() ** 2
-        
-        # 过滤过短的噪点
         valid_paths = [p for p in raw_paths if len(p) > min_len]
         if not valid_paths: return []
 
         merged_paths = []
-        
         while valid_paths:
             current_path = valid_paths.pop(0)
-            
             while True:
-                # 寻找与 current_path 终点最近的起点
                 end_pt = current_path[-1]
                 best_idx = -1
                 min_d = float('inf')
                 should_reverse = False
-                
-                # 只搜索前200个以提高性能（如果路径极多）
                 search_limit = min(len(valid_paths), 200)
                 
                 for i in range(search_limit):
                     p = valid_paths[i]
-                    # 检查 p 的起点
                     d1 = (p[0][0] - end_pt[0])**2 + (p[0][1] - end_pt[1])**2
-                    # 检查 p 的终点 (也许可以反向连接)
                     d2 = (p[-1][0] - end_pt[0])**2 + (p[-1][1] - end_pt[1])**2
-                    
                     curr_min = min(d1, d2)
                     if curr_min < min_d:
                         min_d = curr_min
@@ -220,16 +334,11 @@ class AutoDrawApp:
                         should_reverse = (d2 < d1)
                 
                 if best_idx != -1 and min_d <= connect_dist_sq:
-                    # 合并
                     next_path = valid_paths.pop(best_idx)
-                    if should_reverse:
-                        next_path.reverse()
+                    if should_reverse: next_path.reverse()
                     current_path.extend(next_path)
-                else:
-                    break # 找不到够近的，结束这一笔
-            
+                else: break
             merged_paths.append(current_path)
-            
         return merged_paths
 
     def update_canvas_preview(self, img_data):
@@ -241,20 +350,25 @@ class AutoDrawApp:
         new_w, new_h = int(w*ratio), int(h*ratio)
         
         resized = cv2.resize(img_data, (new_w, new_h), interpolation=cv2.INTER_NEAREST)
-        resized = cv2.bitwise_not(resized) # 黑底白线转白底黑线方便查看
+        resized = cv2.bitwise_not(resized) 
         
         self.tk_img = ImageTk.PhotoImage(Image.fromarray(resized))
         self.canvas.delete("all")
         self.canvas.create_image(c_w//2, c_h//2, image=self.tk_img)
 
     def select_screen_area(self):
-        self.root.withdraw()
-        self.root.after(200, lambda: ScreenAreaSelector(self.root, self.on_area_selected))
+        if self.use_adb.get():
+            self.capture_adb_screen()
+        else:
+            self.root.withdraw()
+            self.root.after(200, lambda: ScreenAreaSelector(self.root, self.on_area_selected))
 
     def on_area_selected(self, area):
-        self.root.deiconify()
-        self.target_area = area
-        self.lbl_status.config(text="区域已锁定。请切换到画图软件，按 [F9] 开始绘制。")
+        if not self.use_adb.get():
+            self.root.deiconify()
+        self.target_area = area 
+        mode_str = "ADB" if self.use_adb.get() else "屏幕"
+        self.lbl_status.config(text=f"{mode_str}区域已锁定。按 [F9] 开始绘制。")
 
     def on_f9_press(self):
         if not self.target_area or not self.final_paths: 
@@ -275,91 +389,190 @@ class AutoDrawApp:
         self.is_running = False
         self.lbl_status.config(text="正在停止...")
 
+    def adb_swipe_pipe(self, x1, y1, x2, y2, duration=100):
+        if self.adb_process is None or self.adb_process.poll() is not None:
+            print("ADB Process died, restarting...")
+            self.adb_process = subprocess.Popen(
+                ["adb", "shell"], 
+                stdin=subprocess.PIPE, 
+                stdout=subprocess.DEVNULL, 
+                stderr=subprocess.DEVNULL,
+                text=True, 
+                bufsize=0 
+            )
+        
+        try:
+            cmd = f"input swipe {int(x1)} {int(y1)} {int(x2)} {int(y2)} {int(duration)}\n"
+            self.adb_process.stdin.write(cmd)
+            self.adb_process.stdin.flush()
+            wait_time = (duration / 1000.0) + 0.02
+            time.sleep(wait_time)
+        except Exception as e:
+            print(f"Pipe Write Error: {e}")
+
+    def filter_points_adaptive(self, points, min_dist=20):
+        """智能过滤算法：距离累积桥接"""
+        if not points or len(points) < 2: return points
+        
+        filtered = [points[0]]
+        for pt in points[1:]:
+            last = filtered[-1]
+            dist = math.sqrt((pt[0]-last[0])**2 + (pt[1]-last[1])**2)
+            # 只有距离足够才下笔（桥接）
+            if dist >= min_dist:
+                filtered.append(pt)
+        
+        # 确保终点逻辑
+        if filtered[-1] != points[-1]:
+             last_dist = math.sqrt((filtered[-1][0]-points[-1][0])**2 + (filtered[-1][1]-points[-1][1])**2)
+             # 只有当剩余距离有意义时才补上
+             if last_dist > 5:
+                 filtered.append(points[-1])
+                 
+        return filtered
+
     def _drawing_process(self):
         stroke_delay = self.scale_delay.get()
-        # 获取图片尺寸
-        img_h, img_w = self.src_img.shape[:2] # 使用原始比例
-        
+        img_h, img_w = self.src_img.shape[:2]
         tx, ty, tw, th = self.target_area
         
-        # 计算缩放比例，保持纵横比
         scale = min(tw / img_w, th / img_h)
-        # 居中偏移量
         offset_x = tx + (tw - img_w * scale) / 2
         offset_y = ty + (th - img_h * scale) / 2
         
-        pyautogui.FAILSAFE = True
-        # 极低的基础延时，主要靠我们的手动 sleep 控制
-        pyautogui.PAUSE = 0.005 
+        if not self.use_adb.get():
+            pyautogui.FAILSAFE = True
+            pyautogui.PAUSE = 0.005 
 
-        self.lbl_status.config(text=">>> 正在绘制中... 按 [F10] 停止 <<<")
+        if self.use_adb.get():
+            try:
+                self.adb_process = subprocess.Popen(
+                    ["adb", "shell"], 
+                    stdin=subprocess.PIPE, 
+                    stdout=subprocess.DEVNULL, 
+                    stderr=subprocess.DEVNULL,
+                    text=True, 
+                    bufsize=0  
+                )
+                print("ADB Shell Session Started.")
+            except Exception as e:
+                self.root.after(0, lambda: messagebox.showerror("Error", f"ADB 启动失败: {e}"))
+                self.is_running = False
+                return
+
+        self.root.after(0, lambda: self.lbl_status.config(text=">>> 正在绘制中... 按 [F10] 停止 <<<"))
+        
+        # 获取用户自定义的 ADB 参数
+        adb_epsilon_factor = self.scale_adb_epsilon.get() # 0.001
+        adb_min_dist = self.scale_adb_dist.get()          # 20
+        adb_min_duration = self.scale_adb_duration.get()  # 160
         
         try:
             total_paths = len(self.final_paths)
             for i, path in enumerate(self.final_paths):
                 if not self.is_running: break
                 
-                # 转换坐标
-                screen_points = []
+                target_points = []
                 for px, py in path:
-                    sx = int(offset_x + px * scale)
-                    sy = int(offset_y + py * scale)
-                    screen_points.append((sx, sy))
+                    sx = offset_x + px * scale
+                    sy = offset_y + py * scale
+                    target_points.append([sx, sy])
                 
-                if len(screen_points) < 2: continue
+                if len(target_points) < 2: continue
 
-                # --- 稳定性绘制逻辑 ---
-                
-                # 1. 移动到起点
-                start_x, start_y = screen_points[0]
-                pyautogui.keyUp('shift') # 防止意外连选
-                pyautogui.mouseUp()
-                pyautogui.moveTo(start_x, start_y)
-                
-                # 2. 停顿，等待鼠标归位
-                time.sleep(0.02) 
+                # === ADB 模式 (自适应桥接 + 矢量延伸) ===
+                if self.use_adb.get():
+                    # 1. RDP 算法 (使用用户设定的精度)
+                    pts_np = np.array(target_points, dtype=np.int32)
+                    arc_len = cv2.arcLength(pts_np, False)
+                    epsilon = adb_epsilon_factor * arc_len 
+                    approx_curve = cv2.approxPolyDP(pts_np, epsilon, False)
+                    curve_points = approx_curve.reshape(-1, 2).tolist()
+                    
+                    # 2. 距离桥接 (使用用户设定的最小距离)
+                    final_points = self.filter_points_adaptive(curve_points, min_dist=adb_min_dist)
+                    
+                    # 3. 微小路径矢量延伸
+                    # 如果过滤后只剩一个点，说明整条线都小于最小距离
+                    # 强制“伪造”一个终点，长度延伸到 adb_min_dist
+                    if len(final_points) < 2:
+                        p_start = target_points[0]
+                        p_end = target_points[-1]
+                        
+                        dx = p_end[0] - p_start[0]
+                        dy = p_end[1] - p_start[1]
+                        real_len = math.sqrt(dx*dx + dy*dy)
+                        
+                        if real_len > 0:
+                            factor = float(adb_min_dist) / real_len
+                            new_x = p_start[0] + dx * factor
+                            new_y = p_start[1] + dy * factor
+                            final_points = [p_start, [new_x, new_y]]
+                        else:
+                            final_points = []
 
-                # 3. 下笔，给予软件反应时间
-                pyautogui.mouseDown()
-                time.sleep(0.05) # 关键延时：防漏笔
+                    # 4. 执行绘制
+                    if len(final_points) > 1:
+                        for j in range(len(final_points) - 1):
+                            if not self.is_running: break
+                            p1 = final_points[j]
+                            p2 = final_points[j+1]
+                            
+                            dist = math.sqrt((p1[0]-p2[0])**2 + (p1[1]-p2[1])**2)
+                            
+                            # 动态时长 (基于用户设定的最小时间)
+                            # 如果距离很长，时间适当增加
+                            duration = int(max(adb_min_duration, min(1500, adb_min_duration + dist * 1.1)))
+                            
+                            self.adb_swipe_pipe(p1[0], p1[1], p2[0], p2[1], duration)
+                    
+                    if stroke_delay > 0: time.sleep(stroke_delay)
 
-                # 4. 绘制路径
-                # 优化：如果是直线，其实不需要每个点都走，但在Canny模式下点很密集
-                # 我们每隔几个点走一次，提高速度，除非是拐角
-                # 这里为了简单直接遍历，因为pyautogui底层有处理
+                # === PC 模式 (保持不变) ===
+                else:
+                    start_x, start_y = int(target_points[0][0]), int(target_points[0][1])
+                    pyautogui.keyUp('shift')
+                    pyautogui.mouseUp()
+                    pyautogui.moveTo(start_x, start_y)
+                    time.sleep(0.02)
+                    pyautogui.mouseDown()
+                    time.sleep(0.05)
+                    step = 2 
+                    for j in range(1, len(target_points), step):
+                        if not self.is_running: break
+                        x, y = int(target_points[j][0]), int(target_points[j][1])
+                        pyautogui.moveTo(x, y)
+                    end_x, end_y = int(target_points[-1][0]), int(target_points[-1][1])
+                    pyautogui.moveTo(end_x, end_y)
+                    time.sleep(0.02)
+                    pyautogui.mouseUp()
+                    if stroke_delay > 0: time.sleep(stroke_delay)
                 
-                # 提高速度：使用 dragTo 还是 moveTo+mouseDown?
-                # 实测 moveTo 配合 mouseDown 状态更可控
-                
-                # 抽稀点，避免每1像素移动一次导致卡顿
-                step = 2 
-                for j in range(1, len(screen_points), step):
-                    if not self.is_running: break
-                    x, y = screen_points[j]
-                    pyautogui.moveTo(x, y)
-                
-                # 确保终点被画到
-                end_x, end_y = screen_points[-1]
-                pyautogui.moveTo(end_x, end_y)
-                
-                # 5. 抬笔前的停顿
-                time.sleep(0.02) # 关键延时：确保最后一笔画完
-                pyautogui.mouseUp()
-                
-                if i % 10 == 0: 
-                    print(f"Drawing path {i}/{total_paths}")
-                
-                # 笔画间的额外休息
-                if stroke_delay > 0:
-                    time.sleep(stroke_delay)
+                # === 状态更新 ===
+                interval = 1 if self.use_adb.get() else 5
+                if i % interval == 0 or i == total_paths - 1:
+                    status_text = f"绘制中... 进度: {i + 1}/{total_paths}"
+                    self.root.after(0, lambda t=status_text: self.lbl_status.config(text=t))
+                    self.root.after(0, self.root.update_idletasks)
                 
         except Exception as e:
             print(f"Error: {e}")
-            self.lbl_status.config(text=f"错误: {e}")
+            self.root.after(0, lambda: self.lbl_status.config(text=f"错误: {e}"))
         finally:
-            pyautogui.mouseUp()
+            if self.use_adb.get() and self.adb_process:
+                try:
+                    self.adb_process.stdin.close()
+                    self.adb_process.terminate()
+                    self.adb_process.wait(timeout=1)
+                except:
+                    pass
+                self.adb_process = None
+                print("ADB Shell Session Closed.")
+
+            if not self.use_adb.get():
+                pyautogui.mouseUp()
             self.is_running = False
-            self.lbl_status.config(text="绘制结束。")
+            self.root.after(0, lambda: self.lbl_status.config(text="绘制结束。"))
 
 if __name__ == "__main__":
     root = tk.Tk()
