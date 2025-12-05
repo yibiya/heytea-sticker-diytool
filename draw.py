@@ -88,8 +88,8 @@ class ModernAutoDrawApp(ctk.CTk):
         self.scrcpy_process = None
         
         self.use_scrcpy = ctk.BooleanVar(value=False)
-        self.var_canny = ctk.IntVar(value=10)      # 原始默认值 100
-        self.var_min_len = ctk.IntVar(value=10)     # 原始默认值 20
+        self.var_canny = ctk.IntVar(value=10)      # 原始默认值 10
+        self.var_min_len = ctk.IntVar(value=10)     # 原始默认值 10
         self.var_connect = ctk.IntVar(value=5)      # 原始默认值 5
         self.var_delay = ctk.DoubleVar(value=0.05)  # 原始默认值 0.05
         
@@ -397,4 +397,5 @@ class ModernAutoDrawApp(ctk.CTk):
 
 if __name__ == "__main__":
     app = ModernAutoDrawApp()
+
     app.mainloop()
